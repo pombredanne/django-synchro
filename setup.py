@@ -5,14 +5,14 @@ setup(
     name='django-synchro',
     description='Django app for database data synchronization.',
     long_description=open('README.rst').read(),
-    version='0.4.2',
+    version='0.5.1',
     author='Jacek Tomaszewski',
     author_email='jacek.tomek@gmail.com',
     url='https://github.com/zlorf/django-synchro',
     license='MIT',
     install_requires=(
         'django-dbsettings>=0.1',
-        'django>=1.3',
+        'django>=1.4',
     ),
     classifiers=[
         'Development Status :: 4 - Beta',

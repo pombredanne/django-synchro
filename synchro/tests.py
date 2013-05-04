@@ -1,7 +1,7 @@
 import datetime
 
+from django import get_version
 from django.conf import settings
-from django.contrib.auth.models import User
 from django.core.exceptions import ValidationError, ImproperlyConfigured
 from django.core.management import call_command, CommandError
 from django.core.urlresolvers import reverse
@@ -18,6 +18,20 @@ import settings as synchro_settings
 from signals import DisableSynchroLog, disable_synchro_log
 from utility import NaturalManager, reset_synchro, NaturalKeyModel
 
+if get_version() >= '1.5':
+    from django.contrib.auth import get_user_model
+    User = get_user_model()
+
+    def user_model_quite_standard():
+        "Check if installed User object is not too custom for the tests to instantiate it."
+        from django.contrib.auth.models import User as StandardUser
+        if (User.USERNAME_FIELD == StandardUser.USERNAME_FIELD and
+                User.REQUIRED_FIELDS == StandardUser.REQUIRED_FIELDS):
+            return True
+        return False
+else:
+    from django.contrib.auth.models import User
+    user_model_quite_standard = lambda: True
 
 LOCAL = 'default'
 REMOTE = settings.SYNCHRO_REMOTE
@@ -25,7 +39,7 @@ REMOTE = settings.SYNCHRO_REMOTE
 SETTINGS = {
     'SYNCHRO_MODELS': (
         ('synchro', 'testmodel', 'PkModelWithSkip', 'ModelWithKey', 'ModelWithFK', 'A', 'X',
-         'M2mModelWithKey', 'M2mAnother', 'M2mModelWithInter', 'M2mSelf'),
+         'M2mModelWithKey', 'M2mAnother', 'M2mModelWithInter', 'M2mSelf', 'ModelWithFKtoKey'),
     )
 }
 
@@ -90,6 +104,10 @@ class CustomManager(models.Manager):
         return 'Not a single object!'
 
 
+class MyNaturalManager(NaturalManager, CustomManager):
+    fields = ('name',)
+
+
 class ModelWithKey(NaturalKeyModel):
     name = models.CharField(max_length=10)
     cash = models.IntegerField(default=0)
@@ -98,6 +116,12 @@ class ModelWithKey(NaturalKeyModel):
     _natural_key = ('name',)
 
     objects = CustomManager()
+    another_objects = MyNaturalManager()
+
+
+class ModelWithFKtoKey(models.Model):
+    name = models.CharField(max_length=10)
+    link = models.ForeignKey(ModelWithKey, related_name='links')
 
 
 class M2mModelWithKey(models.Model):
@@ -230,23 +254,23 @@ class SimpleSynchroTests(SynchroTests):
 
     def test_app_paths(self):
         """Check if app in SYNCHRO_MODELS can be stated in any way."""
-        from django.contrib.auth.models import User
-        self.assertNotIn(User, synchro_settings.MODELS)
+        from django.contrib.auth.models import Group
+        self.assertNotIn(Group, synchro_settings.MODELS)
 
         INSTALLED_APPS = settings.INSTALLED_APPS + ('django.contrib.auth',)
         with override_settings(INSTALLED_APPS=INSTALLED_APPS):
             # fully qualified path
             with override_settings(SYNCHRO_MODELS=('django.contrib.auth',)):
                 reload(synchro_settings)
-                self.assertIn(User, synchro_settings.MODELS)
+                self.assertIn(Group, synchro_settings.MODELS)
             # app label
             with override_settings(SYNCHRO_MODELS=('auth',)):
                 reload(synchro_settings)
-                self.assertIn(User, synchro_settings.MODELS)
+                self.assertIn(Group, synchro_settings.MODELS)
 
         # Restore previous state
         reload(synchro_settings)
-        self.assertNotIn(User, synchro_settings.MODELS)
+        self.assertNotIn(Group, synchro_settings.MODELS)
 
     def test_settings_with_invalid_remote(self):
         """Check if specifying invalid remote results in exception."""
@@ -438,6 +462,16 @@ class SimpleSynchroTests(SynchroTests):
         self.assertEqual(a.name, b.name)
         self.assertEqual(a.cash, b.cash)
 
+    def test_reference2(self):
+        """Test if reference is created for model found with natural key."""
+        ModelWithKey.objects.db_manager(REMOTE).create(name='James')
+        loc = ModelWithKey.objects.create(name='James')
+        self.wait()
+        ModelWithFKtoKey.objects.create(name='Test', link=loc)
+        self.synchronize()
+        self.assertRemoteCount(1, ModelWithFKtoKey)
+        self.assertRemoteCount(1, ModelWithKey)
+
     def test_time_comparing(self):
         """Test if synchronization is not performed if REMOTE object is newer."""
         a = TestModel.objects.create(name="James", cash=7)
@@ -457,10 +491,11 @@ class SimpleSynchroTests(SynchroTests):
 
     @skipUnless(contrib_apps('admin', 'auth', 'sessions'),
                 'admin, auth or sessions not in INSTALLED_APPS')
+    @skipUnless(user_model_quite_standard(), 'Too custom User model')
     def test_admin(self):
         """Test if synchronization can be performed via admin interface."""
         path = reverse('synchro')
-        user = User.objects.create_user('admin', 'mail', 'admin')
+        user = User._default_manager.create_user('admin', 'mail', 'admin')
         self.client.login(username='admin', password='admin')
         # test if staff status is required
         self.assertTemplateUsed(self.client.get(path), 'admin/login.html')
@@ -474,6 +509,21 @@ class SimpleSynchroTests(SynchroTests):
         self.assertRemoteCount(0, TestModel)
         self.client.post(path, {'synchro': True})  # button clicked
         self.assertRemoteCount(1, TestModel)
+        # resetting
+        self.assertGreater(ChangeLog.objects.count(), 0)
+        self.client.post(path, {'reset': True})  # button clicked
+        self.assertEqual(ChangeLog.objects.count(), 0)
+
+    def test_translation(self):
+        """Test if texts are translated."""
+        from django.utils.translation import override, force_unicode
+        from synchro import call_synchronize
+        languages = ('en', 'pl', 'de', 'es', 'fr')
+        messages = set()
+        for lang in languages:
+            with override(lang):
+                messages.add(force_unicode(call_synchronize()))
+        self.assertEqual(len(messages), len(languages), 'Some language is missing.')
 
 
 class AdvancedSynchroTests(SynchroTests):
@@ -482,13 +532,31 @@ class AdvancedSynchroTests(SynchroTests):
     def test_manager_class(self):
         """Test if NaturalManager works."""
         self.assertIsInstance(ModelWithKey.objects, NaturalManager)
+        self.assertIsInstance(ModelWithKey.another_objects, NaturalManager)
         # Test if it subclasses user manager as well
         self.assertIsInstance(ModelWithKey.objects, CustomManager)
+        self.assertIsInstance(ModelWithKey.another_objects, CustomManager)
         self.assertEqual('bar', ModelWithKey.objects.foo())
+        self.assertEqual('bar', ModelWithKey.another_objects.foo())
         # Check proper MRO: NaturalManager, user manager, Manager
         self.assertTrue(hasattr(ModelWithKey.objects, 'get_by_natural_key'))
+        self.assertTrue(hasattr(ModelWithKey.another_objects, 'get_by_natural_key'))
         self.assertEqual('Not a single object!', ModelWithKey.objects.none())
+        self.assertEqual('Not a single object!', ModelWithKey.another_objects.none())
         self.assertSequenceEqual([], ModelWithKey.objects.all())
+        self.assertSequenceEqual([], ModelWithKey.another_objects.all())
+
+        # Test get_by_natural_key
+        obj = ModelWithKey.objects.create(name='James')
+        self.assertEqual(obj.pk, ModelWithKey.objects.get_by_natural_key('James').pk)
+        self.assertEqual(obj.pk, ModelWithKey.another_objects.get_by_natural_key('James').pk)
+
+        # Test instantiating (DJango #13313: manager must be instantiable without arguments)
+        try:
+            ModelWithKey.objects.__class__()
+            ModelWithKey.another_objects.__class__()
+        except TypeError:
+            self.fail('Cannot instantiate.')
 
         # Test if class checking occurs
         def wrong():
@@ -765,7 +833,6 @@ class M2MSynchroTests(SynchroTests):
         self.assertRemoteCount(1, M2mIntermediate)
         inter = M2mIntermediate.objects.db_manager(REMOTE).all()[0]
         self.assertEqual(1, inter.cash)
-
 
         # Tricky: clear from other side of relation.
         self.wait()
